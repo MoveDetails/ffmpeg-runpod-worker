@@ -13,15 +13,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Get short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v3.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./runpod-worker
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/ffmpeg-runpod-worker:latest
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/ffmpeg-runpod-worker:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/ffmpeg-runpod-worker:sha-${{ steps.sha.outputs.short }}
