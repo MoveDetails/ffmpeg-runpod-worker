@@ -59,8 +59,17 @@ def _upload_file(local_path: str, storage_path: str, content_type: str):
 
 def _upload_and_sign_segment(args: tuple) -> tuple[str, str]:
     ts_name, local_path, storage_path = args
-    _upload_file(local_path, storage_path, "application/octet-stream")
-    signed = _sign(storage_path)
+    # Each thread gets its own client to avoid sharing an HTTP/2 connection
+    client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    with open(local_path, "rb") as f:
+        data = f.read()
+    client.storage.from_(BUCKET).upload(
+        storage_path, data, {"content-type": "application/octet-stream", "upsert": "true"}
+    )
+    res = client.storage.from_(BUCKET).create_signed_url(storage_path, SIGNED_URL_TTL)
+    signed = res.get("signedURL") or res.get("signedUrl")
+    if not signed:
+        raise RuntimeError(f"Failed to sign {storage_path}: {res}")
     return ts_name, signed
 
 
@@ -151,7 +160,7 @@ def handler(job: dict) -> dict:
             for ts_name in ts_files
         ]
         ts_signed: dict[str, str] = {}
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             for ts_name, signed_url in executor.map(_upload_and_sign_segment, upload_tasks):
                 ts_signed[ts_name] = signed_url
 
