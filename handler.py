@@ -1,8 +1,10 @@
 import os
 import re
+import time
 import tempfile
 import subprocess
 import concurrent.futures
+import httpx
 import runpod
 from supabase import create_client, Client
 from datetime import datetime, timezone, timedelta
@@ -59,18 +61,48 @@ def _upload_file(local_path: str, storage_path: str, content_type: str):
 
 def _upload_and_sign_segment(args: tuple) -> tuple[str, str]:
     ts_name, local_path, storage_path = args
-    # Each thread gets its own client to avoid sharing an HTTP/2 connection
-    client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     with open(local_path, "rb") as f:
         data = f.read()
-    client.storage.from_(BUCKET).upload(
-        storage_path, data, {"content-type": "application/octet-stream", "upsert": "true"}
-    )
-    res = client.storage.from_(BUCKET).create_signed_url(storage_path, SIGNED_URL_TTL)
-    signed = res.get("signedURL") or res.get("signedUrl")
-    if not signed:
-        raise RuntimeError(f"Failed to sign {storage_path}: {res}")
-    return ts_name, signed
+
+    auth_headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    }
+    storage_base = f"{SUPABASE_URL}/storage/v1"
+
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(2)
+        try:
+            # Use HTTP/1.1 explicitly — HTTP/2 keep-alive drops cause
+            # RemoteProtocolError on the RunPod → Supabase network path.
+            with httpx.Client(http2=False) as client:
+                up = client.post(
+                    f"{storage_base}/object/{BUCKET}/{storage_path}",
+                    content=data,
+                    headers={**auth_headers, "content-type": "application/octet-stream", "x-upsert": "true"},
+                    timeout=300.0,
+                )
+                up.raise_for_status()
+
+                sg = client.post(
+                    f"{storage_base}/object/sign/{BUCKET}/{storage_path}",
+                    json={"expiresIn": SIGNED_URL_TTL},
+                    headers=auth_headers,
+                    timeout=30.0,
+                )
+                sg.raise_for_status()
+                payload = sg.json()
+                signed = payload.get("signedURL") or payload.get("signedUrl") or ""
+                if not signed:
+                    raise RuntimeError(f"No signedURL in response: {payload}")
+                if signed.startswith("/"):
+                    signed = f"{SUPABASE_URL}{signed}"
+                return ts_name, signed
+        except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.HTTPStatusError, RuntimeError) as exc:
+            last_exc = exc
+    raise RuntimeError(f"Segment upload failed after 3 attempts: {last_exc}") from last_exc
 
 
 def _run_ffmpeg(args: list[str], label: str):
@@ -160,7 +192,7 @@ def handler(job: dict) -> dict:
             for ts_name in ts_files
         ]
         ts_signed: dict[str, str] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             for ts_name, signed_url in executor.map(_upload_and_sign_segment, upload_tasks):
                 ts_signed[ts_name] = signed_url
 
