@@ -59,13 +59,13 @@ def _run_ffmpeg(args: list[str], label: str):
     result = subprocess.run(
         ["ffmpeg"] + args,
         capture_output=True,
-        text=True,
     )
     if result.returncode != 0:
+        stdout = result.stdout.decode("utf-8", errors="replace")[-3000:]
+        stderr = result.stderr.decode("utf-8", errors="replace")[-3000:]
         raise RuntimeError(
             f"ffmpeg {label} failed (exit {result.returncode}):\n"
-            f"STDOUT: {result.stdout[-3000:] if result.stdout else ''}\n"
-            f"STDERR: {result.stderr[-3000:] if result.stderr else ''}"
+            f"STDOUT: {stdout}\nSTDERR: {stderr}"
         )
 
 
@@ -107,6 +107,8 @@ def handler(job: dict) -> dict:
         _run_ffmpeg(
             [
                 "-y", "-i", raw_path,
+                "-map", "0:v:0",
+                "-map", "0:a?",       # optional — skip if no audio stream
                 "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k",
