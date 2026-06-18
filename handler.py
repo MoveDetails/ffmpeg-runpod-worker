@@ -1,8 +1,6 @@
 import os
-import re
 import tempfile
 import subprocess
-import httpx
 import runpod
 from supabase import create_client, Client
 from datetime import datetime, timezone, timedelta
@@ -10,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 BUCKET = "estimate-media"
-SIGNED_URL_TTL = 7 * 24 * 3600  # 7 days in seconds
+THUMBNAIL_TTL = 7 * 24 * 3600  # 7 days — thumbnail shown in media grid without a playback session
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -37,7 +35,7 @@ def _update_file_entry(estimate_id: str, org_id: str, file_id: str, patch: dict)
     ).eq("estimate_id", estimate_id).execute()
 
 
-def _sign(storage_path: str, ttl: int = SIGNED_URL_TTL) -> str:
+def _sign(storage_path: str, ttl: int = THUMBNAIL_TTL) -> str:
     res = supabase.storage.from_(BUCKET).create_signed_url(storage_path, ttl)
     if "signedURL" in res:
         return res["signedURL"]
@@ -56,43 +54,6 @@ def _upload_file(local_path: str, storage_path: str, content_type: str):
     )
 
 
-def _upload_and_sign_segment_serial(local_path: str, storage_path: str) -> str:
-    """Upload one segment and return its signed URL. Uses HTTP/1.1 to avoid
-    RemoteProtocolError caused by HTTP/2 keep-alive drops on the RunPod network."""
-    with open(local_path, "rb") as f:
-        data = f.read()
-
-    auth_headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-    }
-    storage_base = f"{SUPABASE_URL}/storage/v1"
-
-    with httpx.Client(http2=False) as client:
-        up = client.post(
-            f"{storage_base}/object/{BUCKET}/{storage_path}",
-            content=data,
-            headers={**auth_headers, "content-type": "application/octet-stream", "x-upsert": "true"},
-            timeout=300.0,
-        )
-        up.raise_for_status()
-
-        sg = client.post(
-            f"{storage_base}/object/sign/{BUCKET}/{storage_path}",
-            json={"expiresIn": SIGNED_URL_TTL},
-            headers=auth_headers,
-            timeout=30.0,
-        )
-        sg.raise_for_status()
-        payload = sg.json()
-        signed = payload.get("signedURL") or payload.get("signedUrl") or ""
-        if not signed:
-            raise RuntimeError(f"No signedURL in response: {payload}")
-        if signed.startswith("/"):
-            signed = f"{SUPABASE_URL}{signed}"
-        return signed
-
-
 def _run_ffmpeg(args: list[str], label: str):
     result = subprocess.run(
         ["ffmpeg"] + args,
@@ -107,14 +68,6 @@ def _run_ffmpeg(args: list[str], label: str):
         )
 
 
-def _rewrite_m3u8_with_signed_urls(m3u8_path: str, ts_signed: dict[str, str]) -> str:
-    with open(m3u8_path, "r") as f:
-        content = f.read()
-    for filename, signed_url in ts_signed.items():
-        content = re.sub(rf"^{re.escape(filename)}$", signed_url, content, flags=re.MULTILINE)
-    return content
-
-
 def handler(job: dict) -> dict:
     inp = job.get("input", {})
     storage_path: str = inp["storage_path"]
@@ -125,7 +78,6 @@ def handler(job: dict) -> dict:
     _update_file_entry(estimate_id, org_id, file_id, {"transcoding_status": "processing"})
 
     with tempfile.TemporaryDirectory() as tmp:
-        # Download raw input to disk
         raw_path = os.path.join(tmp, "input")
         file_bytes = supabase.storage.from_(BUCKET).download(storage_path)
         with open(raw_path, "wb") as f:
@@ -165,42 +117,31 @@ def handler(job: dict) -> dict:
         _run_ffmpeg(transcode_args, label="transcode")
 
         _run_ffmpeg(
-            [
-                "-y", "-i", raw_path,
-                "-frames:v", "1",
-                "-update", "1",
-                thumbnail_local,
-            ],
+            ["-y", "-i", raw_path, "-frames:v", "1", "-update", "1", thumbnail_local],
             label="thumbnail",
         )
 
         ts_files = sorted(f for f in os.listdir(hls_dir) if f.endswith(".ts"))
         hls_folder = f"{org_id}/{estimate_id}/{file_id}"
 
-        # Upload segments serially, signing each after upload
-        ts_signed: dict[str, str] = {}
+        # Upload segments — bare filenames remain in m3u8; signed URLs are generated at playback time
         for ts_name in ts_files:
-            ts_storage_path = f"{hls_folder}/{ts_name}"
-            ts_signed[ts_name] = _upload_and_sign_segment_serial(
-                os.path.join(hls_dir, ts_name), ts_storage_path
+            _upload_file(
+                os.path.join(hls_dir, ts_name),
+                f"{hls_folder}/{ts_name}",
+                "video/MP2T",
             )
 
         thumbnail_storage_path = f"{hls_folder}/thumbnail.jpg"
         _upload_file(thumbnail_local, thumbnail_storage_path, "image/jpeg")
         thumbnail_signed_url = _sign(thumbnail_storage_path)
 
-        rewritten = _rewrite_m3u8_with_signed_urls(playlist_local, ts_signed)
-        rewritten_path = os.path.join(hls_dir, "playlist_signed.m3u8")
-        with open(rewritten_path, "w") as f:
-            f.write(rewritten)
-
-        m3u8_storage_path = f"{hls_folder}/playlist.m3u8"
-        _upload_file(rewritten_path, m3u8_storage_path, "application/vnd.apple.mpegurl")
-        m3u8_signed_url = _sign(m3u8_storage_path)
+        # Upload m3u8 as produced by ffmpeg (bare segment filenames — no pre-signing)
+        _upload_file(playlist_local, f"{hls_folder}/playlist.m3u8", "application/vnd.apple.mpegurl")
 
     supabase.storage.from_(BUCKET).remove([storage_path])
 
-    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=SIGNED_URL_TTL)).isoformat()
+    thumbnail_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=THUMBNAIL_TTL)).isoformat()
 
     _update_file_entry(
         estimate_id,
@@ -209,11 +150,9 @@ def handler(job: dict) -> dict:
         {
             "transcoding_status": "ready",
             "hls_folder_path": hls_folder,
-            "hls_m3u8_signed_url": m3u8_signed_url,
-            "hls_m3u8_signed_url_expires_at": expires_at,
             "thumbnail_path": thumbnail_storage_path,
             "thumbnail_signed_url": thumbnail_signed_url,
-            "thumbnail_signed_url_expires_at": expires_at,
+            "thumbnail_signed_url_expires_at": thumbnail_expires_at,
             "storage_path": None,
             "signed_url": None,
             "signed_url_expires_at": None,
@@ -223,7 +162,6 @@ def handler(job: dict) -> dict:
     return {
         "file_id": file_id,
         "hls_folder_path": hls_folder,
-        "m3u8_signed_url": m3u8_signed_url,
         "thumbnail_signed_url": thumbnail_signed_url,
     }
 
