@@ -1,0 +1,26 @@
+name: Build & Push RunPod Worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - runpod-worker/**
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./runpod-worker
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/ffmpeg-runpod-worker:latest
