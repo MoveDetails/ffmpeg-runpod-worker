@@ -1,3 +1,2 @@
 runpod
 supabase
-httpx
