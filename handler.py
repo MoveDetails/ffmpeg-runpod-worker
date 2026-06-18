@@ -104,21 +104,31 @@ def handler(job: dict) -> dict:
         segment_pattern = os.path.join(hls_dir, "segment%03d.ts")
         thumbnail_local = os.path.join(hls_dir, "thumbnail.jpg")
 
-        _run_ffmpeg(
-            [
-                "-y", "-i", raw_path,
-                "-map", "0:v:0",
-                "-map", "0:a?",       # optional — skip if no audio stream
-                "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-hls_time", "10",
-                "-hls_playlist_type", "vod",
-                "-hls_segment_filename", segment_pattern,
-                playlist_local,
-            ],
-            label="transcode",
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", raw_path],
+            capture_output=True,
         )
+        has_audio = probe.stdout.strip() != b""
+
+        transcode_args = [
+            "-y", "-i", raw_path,
+            "-map", "0:v:0",
+            "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        ]
+        if has_audio:
+            transcode_args += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "128k"]
+        else:
+            transcode_args += ["-an"]
+        transcode_args += [
+            "-hls_time", "10",
+            "-hls_playlist_type", "vod",
+            "-hls_segment_filename", segment_pattern,
+            playlist_local,
+        ]
+
+        _run_ffmpeg(transcode_args, label="transcode")
 
         _run_ffmpeg(
             [
