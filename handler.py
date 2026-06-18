@@ -108,7 +108,7 @@ def handler(job: dict) -> dict:
 
         for ts_name in ts_files:
             ts_storage_path = f"{hls_folder}/{ts_name}"
-            _upload_file(os.path.join(hls_dir, ts_name), ts_storage_path, "video/mp2t")
+            _upload_file(os.path.join(hls_dir, ts_name), ts_storage_path, "application/octet-stream")
             ts_signed[ts_name] = _sign(ts_storage_path)
 
         thumbnail_storage_path = f"{hls_folder}/thumbnail.jpg"
