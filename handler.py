@@ -114,7 +114,7 @@ def handler(job: dict) -> dict:
         transcode_args = [
             "-y", "-i", raw_path,
             "-map", "0:v:0",
-            "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
+            "-vf", "scale='trunc(min(1920,iw)/2)*2':'trunc(min(1080,ih)/2)*2':force_original_aspect_ratio=decrease",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         ]
         if has_audio:
@@ -133,7 +133,7 @@ def handler(job: dict) -> dict:
         _run_ffmpeg(
             [
                 "-y", "-i", raw_path,
-                "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
+                "-vf", "scale='trunc(min(1920,iw)/2)*2':'trunc(min(1080,ih)/2)*2':force_original_aspect_ratio=decrease",
                 "-frames:v", "1",
                 "-update", "1",
                 thumbnail_local,
