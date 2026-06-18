@@ -1,17 +1,18 @@
 import os
 import re
-import json
 import tempfile
 import subprocess
 import runpod
 from supabase import create_client, Client
+from datetime import datetime, timezone, timedelta
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 BUCKET = "estimate-media"
-SIGNED_URL_TTL = 7 * 24 * 3600
+SIGNED_URL_TTL = 7 * 24 * 3600  # 7 days in seconds
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
 
 def _update_file_entry(estimate_id: str, org_id: str, file_id: str, patch: dict):
     row = (
@@ -23,14 +24,17 @@ def _update_file_entry(estimate_id: str, org_id: str, file_id: str, patch: dict)
     )
     if not row.data:
         raise RuntimeError(f"estimate_media row not found for estimate {estimate_id}")
+
     files = row.data["data"].get("files", [])
     updated = [
         {**f, **patch} if f.get("id") == file_id else f
         for f in files
     ]
+
     supabase.table("estimate_media").update(
         {"data": {"files": updated}, "updated_at": "now()"}
     ).eq("estimate_id", estimate_id).execute()
+
 
 def _sign(storage_path: str) -> str:
     res = supabase.storage.from_(BUCKET).create_signed_url(storage_path, SIGNED_URL_TTL)
@@ -39,6 +43,7 @@ def _sign(storage_path: str) -> str:
     if "signedUrl" in res:
         return res["signedUrl"]
     raise RuntimeError(f"Failed to sign {storage_path}: {res}")
+
 
 def _upload_file(local_path: str, storage_path: str, content_type: str):
     with open(local_path, "rb") as f:
@@ -49,12 +54,28 @@ def _upload_file(local_path: str, storage_path: str, content_type: str):
         {"content-type": content_type, "upsert": "true"},
     )
 
-def _rewrite_m3u8_with_signed_urls(m3u8_path: str, ts_signed: dict) -> str:
+
+def _run_ffmpeg(args: list[str], label: str):
+    result = subprocess.run(
+        ["ffmpeg"] + args,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg {label} failed (exit {result.returncode}):\n"
+            f"STDOUT: {result.stdout[-3000:] if result.stdout else ''}\n"
+            f"STDERR: {result.stderr[-3000:] if result.stderr else ''}"
+        )
+
+
+def _rewrite_m3u8_with_signed_urls(m3u8_path: str, ts_signed: dict[str, str]) -> str:
     with open(m3u8_path, "r") as f:
         content = f.read()
     for filename, signed_url in ts_signed.items():
         content = re.sub(rf"^{re.escape(filename)}$", signed_url, content, flags=re.MULTILINE)
     return content
+
 
 def handler(job: dict) -> dict:
     inp = job.get("input", {})
@@ -67,7 +88,12 @@ def handler(job: dict) -> dict:
 
     with tempfile.TemporaryDirectory() as tmp:
         raw_path = os.path.join(tmp, "input_video")
+
         response = supabase.storage.from_(BUCKET).download(storage_path)
+        if not isinstance(response, (bytes, bytearray)):
+            raise RuntimeError(f"Download failed, got: {response}")
+        if len(response) == 0:
+            raise RuntimeError(f"Downloaded file is empty: {storage_path}")
         with open(raw_path, "wb") as f:
             f.write(response)
 
@@ -78,9 +104,9 @@ def handler(job: dict) -> dict:
         segment_pattern = os.path.join(hls_dir, "segment%03d.ts")
         thumbnail_local = os.path.join(hls_dir, "thumbnail.jpg")
 
-        subprocess.run(
+        _run_ffmpeg(
             [
-                "ffmpeg", "-y", "-i", raw_path,
+                "-y", "-i", raw_path,
                 "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k",
@@ -89,22 +115,23 @@ def handler(job: dict) -> dict:
                 "-hls_segment_filename", segment_pattern,
                 playlist_local,
             ],
-            check=True,
+            label="transcode",
         )
 
-        subprocess.run(
+        _run_ffmpeg(
             [
-                "ffmpeg", "-y", "-i", raw_path,
+                "-y", "-i", raw_path,
                 "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
                 "-frames:v", "1",
+                "-update", "1",
                 thumbnail_local,
             ],
-            check=True,
+            label="thumbnail",
         )
 
         ts_files = sorted(f for f in os.listdir(hls_dir) if f.endswith(".ts"))
         hls_folder = f"{org_id}/{estimate_id}/{file_id}"
-        ts_signed = {}
+        ts_signed: dict[str, str] = {}
 
         for ts_name in ts_files:
             ts_storage_path = f"{hls_folder}/{ts_name}"
@@ -126,7 +153,6 @@ def handler(job: dict) -> dict:
 
     supabase.storage.from_(BUCKET).remove([storage_path])
 
-    from datetime import datetime, timezone, timedelta
     expires_at = (datetime.now(timezone.utc) + timedelta(seconds=SIGNED_URL_TTL)).isoformat()
 
     _update_file_entry(
@@ -153,5 +179,6 @@ def handler(job: dict) -> dict:
         "m3u8_signed_url": m3u8_signed_url,
         "thumbnail_signed_url": thumbnail_signed_url,
     }
+
 
 runpod.serverless.start({"handler": handler})
