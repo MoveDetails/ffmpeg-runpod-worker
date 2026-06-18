@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 import subprocess
+import concurrent.futures
 import runpod
 from supabase import create_client, Client
 from datetime import datetime, timezone, timedelta
@@ -10,6 +11,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 BUCKET = "estimate-media"
 SIGNED_URL_TTL = 7 * 24 * 3600  # 7 days in seconds
+INPUT_SIGNED_URL_TTL = 3600  # 1 hour — enough for ffmpeg to finish
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -36,8 +38,8 @@ def _update_file_entry(estimate_id: str, org_id: str, file_id: str, patch: dict)
     ).eq("estimate_id", estimate_id).execute()
 
 
-def _sign(storage_path: str) -> str:
-    res = supabase.storage.from_(BUCKET).create_signed_url(storage_path, SIGNED_URL_TTL)
+def _sign(storage_path: str, ttl: int = SIGNED_URL_TTL) -> str:
+    res = supabase.storage.from_(BUCKET).create_signed_url(storage_path, ttl)
     if "signedURL" in res:
         return res["signedURL"]
     if "signedUrl" in res:
@@ -53,6 +55,13 @@ def _upload_file(local_path: str, storage_path: str, content_type: str):
         data,
         {"content-type": content_type, "upsert": "true"},
     )
+
+
+def _upload_and_sign_segment(args: tuple) -> tuple[str, str]:
+    ts_name, local_path, storage_path = args
+    _upload_file(local_path, storage_path, "application/octet-stream")
+    signed = _sign(storage_path)
+    return ts_name, signed
 
 
 def _run_ffmpeg(args: list[str], label: str):
@@ -86,17 +95,10 @@ def handler(job: dict) -> dict:
 
     _update_file_entry(estimate_id, org_id, file_id, {"transcoding_status": "processing"})
 
+    # Sign the raw input so ffmpeg can stream it directly — no full download to memory
+    input_url = _sign(storage_path, ttl=INPUT_SIGNED_URL_TTL)
+
     with tempfile.TemporaryDirectory() as tmp:
-        raw_path = os.path.join(tmp, "input_video")
-
-        response = supabase.storage.from_(BUCKET).download(storage_path)
-        if not isinstance(response, (bytes, bytearray)):
-            raise RuntimeError(f"Download failed, got: {response}")
-        if len(response) == 0:
-            raise RuntimeError(f"Downloaded file is empty: {storage_path}")
-        with open(raw_path, "wb") as f:
-            f.write(response)
-
         hls_dir = os.path.join(tmp, "hls")
         os.makedirs(hls_dir)
 
@@ -106,13 +108,13 @@ def handler(job: dict) -> dict:
 
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
-             "-show_entries", "stream=codec_type", "-of", "csv=p=0", raw_path],
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", input_url],
             capture_output=True,
         )
         has_audio = probe.stdout.strip() != b""
 
         transcode_args = [
-            "-y", "-i", raw_path,
+            "-y", "-i", input_url,
             "-map", "0:v:0",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
@@ -132,7 +134,7 @@ def handler(job: dict) -> dict:
 
         _run_ffmpeg(
             [
-                "-y", "-i", raw_path,
+                "-y", "-i", input_url,
                 "-frames:v", "1",
                 "-update", "1",
                 thumbnail_local,
@@ -142,12 +144,16 @@ def handler(job: dict) -> dict:
 
         ts_files = sorted(f for f in os.listdir(hls_dir) if f.endswith(".ts"))
         hls_folder = f"{org_id}/{estimate_id}/{file_id}"
-        ts_signed: dict[str, str] = {}
 
-        for ts_name in ts_files:
-            ts_storage_path = f"{hls_folder}/{ts_name}"
-            _upload_file(os.path.join(hls_dir, ts_name), ts_storage_path, "application/octet-stream")
-            ts_signed[ts_name] = _sign(ts_storage_path)
+        # Upload all segments in parallel, signing each after its upload completes
+        upload_tasks = [
+            (ts_name, os.path.join(hls_dir, ts_name), f"{hls_folder}/{ts_name}")
+            for ts_name in ts_files
+        ]
+        ts_signed: dict[str, str] = {}
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            for ts_name, signed_url in executor.map(_upload_and_sign_segment, upload_tasks):
+                ts_signed[ts_name] = signed_url
 
         thumbnail_storage_path = f"{hls_folder}/thumbnail.jpg"
         _upload_file(thumbnail_local, thumbnail_storage_path, "image/jpeg")
